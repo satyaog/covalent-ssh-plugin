@@ -21,6 +21,7 @@ Executor plugin for executing the function on a remote machine through SSH.
 import asyncio
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Optional, Tuple, Union
 
@@ -48,6 +49,20 @@ _EXECUTOR_PLUGIN_DEFAULTS = {
     "remote_workdir": "covalent-workdir",
     "create_unique_workdir": False,
 }
+
+_SETUP_FLAG_FILE = "covalent_setup_returncode"
+
+
+async def _conn_run(conn:asyncssh.SSHClientConnection, cmd, raise_on_error=True):
+    completed_proc = await conn.run(cmd)
+    if raise_on_error and completed_proc.returncode != 0:
+        message = (
+            f"Command failed with {completed_proc.returncode}:"
+            f"\n    {cmd}"
+            f"\n{completed_proc.stdout}"
+            f"\n{completed_proc.stderr}")
+        raise RuntimeError(message)
+    return completed_proc
 
 
 class SSHExecutor(RemoteExecutor):
@@ -280,6 +295,75 @@ class SSHExecutor(RemoteExecutor):
 
         # Failed to connect to client.
         return None
+
+    async def setup(self, task_metadata: Dict) -> None:
+        """Executor specific setup method"""
+        conn = await self._attempt_client_connect()
+
+        if not conn:
+            message = f"Could not connect to host: '{self.hostname}' as user: '{self.username}'"
+            raise RuntimeError(message)
+
+        t =- time.time()
+        MAX_SEC = 10*60
+        while True:
+            if await self._check_setup(conn, task_metadata) == 0:
+                return
+
+            if t + time.time() >= MAX_SEC:
+                raise TimeoutError(f"Could not initialize covalent within {MAX_SEC} secs")
+
+            await self._setup(conn, task_metadata)
+
+    async def _check_setup(self, conn, task_metadata: Dict):
+        setup_flag_file = f"{self.remote_workdir}/{_SETUP_FLAG_FILE}"
+        try:
+            p = await _conn_run(conn, f"{self.python_path} -c 'import covalent' && exit `cat {setup_flag_file}`")
+            return p.returncode
+        except RuntimeError:
+            return None
+
+    async def _setup(self, conn, task_metadata: Dict) -> None:
+        venv = self.python_path.replace('/bin/python3', '')
+        setup_flag_file = f"{self.remote_workdir}/{_SETUP_FLAG_FILE}"
+        lock_id = f"{task_metadata['dispatch_id']}:{task_metadata['node_id']}"
+
+        await _conn_run(conn, f"mkdir -p {self.remote_workdir}")
+
+        # WARNING: This code can prevent correctly installing covalent if the
+        # setup is in an invalid state with a invalid lock file
+        p = await _conn_run(conn, f"[ -e {setup_flag_file}.lock ] && cat {setup_flag_file}.lock", raise_on_error=False)
+        if p.stdout != lock_id:
+            await _conn_run(conn, f"[ ! -e {setup_flag_file}.lock ] && echo -n '{lock_id}' >{setup_flag_file}.lock", raise_on_error=False)
+        p = await _conn_run(conn, f"cat {setup_flag_file}.lock")
+
+        if p.stdout == lock_id:
+            try:
+                for cmd in (
+                    f"echo -1 >{setup_flag_file}",
+                    f"sudo apt update",
+                    f"sudo apt install -y python3-pip",
+                    f"python3 -m pip install --upgrade virtualenv",
+                    f"python3 -m virtualenv {venv}",
+                    f"{self.python_path} -m pip install --upgrade pip",
+                    f"{self.python_path} -m pip install covalent && echo $? >{setup_flag_file} || echo $? >{setup_flag_file}",
+                ):
+                    await _conn_run(conn, cmd)
+            finally:
+                await _conn_run(conn, f"rm {setup_flag_file}.lock", raise_on_error=False)
+        else:
+            await asyncio.sleep(1)
+
+    async def teardown(self, task_metadata: Dict) -> None:
+        conn = await self._attempt_client_connect()
+
+        if not conn:
+            message = f"Could not connect to host: '{self.hostname}' as user: '{self.username}'"
+            raise RuntimeError(message)
+
+        setup_flag_file = f"{self.remote_workdir}/{_SETUP_FLAG_FILE}"
+
+        await _conn_run(conn, f"rm {setup_flag_file}.lock", raise_on_error=False)
 
     async def cleanup(
         self,
